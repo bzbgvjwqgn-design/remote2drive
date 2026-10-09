@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>History · Remote → Drive</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="top">
+    <span class="brand">Remote → Drive</span>
+    <nav id="topnav"></nav>
+  </header>
+
+  <main class="wrap">
+    <div id="alert" class="alert"></div>
+
+    <h1>Transfer history</h1>
+    <p class="lede">Every job you have submitted, newest first. Live rows update over the progress stream.</p>
+
+    <div class="filters" id="filters">
+      <button data-status="" class="on">All</button>
+      <button data-status="TRANSFERRING">Running</button>
+      <button data-status="QUEUED">Queued</button>
+      <button data-status="COMPLETED">Completed</button>
+      <button data-status="FAILED">Failed</button>
+      <button data-status="CANCELLED">Cancelled</button>
+    </div>
+
+    <div class="card" style="padding:0; overflow:hidden;">
+      <table>
+        <thead>
+          <tr>
+            <th>File</th>
+            <th>Status</th>
+            <th class="num">Size</th>
+            <th class="num">Progress</th>
+            <th>Submitted</th>
+            <th class="right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+
+    <div id="empty" class="empty hidden">No jobs match this filter.</div>
+    <div style="margin-top:16px; text-align:center;">
+      <button class="ghost hidden" id="more">Load more</button>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    'use strict';
+
+    let status = '';
+    let cursor = null;
+    let jobs = new Map();
+
+    function rowFor(job) {
+      const tr = document.createElement('tr');
+      tr.dataset.jobId = job.id;
+      tr.innerHTML = `
+        <td>
+          <div data-f="name"></div>
+          <div class="src mono muted" data-f="src"></div>
+          <div class="error hidden" data-f="error"></div>
+        </td>
+        <td><span class="pill" data-f="status"></span></td>
+        <td class="num" data-f="size"></td>
+        <td class="num" data-f="progress"></td>
+        <td class="muted" data-f="when"></td>
+        <td class="right" data-f="actions" style="white-space:nowrap;"></td>`;
+      paintRow(tr, job);
+      return tr;
+    }
+
+    function paintRow(tr, job) {
+      const f = (n) => tr.querySelector(`[data-f="${n}"]`);
+      f('name').textContent = job.fileName || '(unnamed)';
+      f('src').textContent = truncateMiddle(job.sourceUrl, 68);
+
+      const pill = f('status');
+      pill.className = `pill ${job.status}`;
+      pill.textContent = job.status === 'TRANSFERRING'
+        ? (job.phase && job.phase !== 'queued' ? job.phase : 'running')
+        : job.status.toLowerCase();
+
+      f('size').textContent = formatBytes(job.totalBytes);
+      f('progress').textContent = job.progress === null || job.progress === undefined
+        ? (job.status === 'TRANSFERRING' ? formatBytes(job.transferredBytes) : '—')
+        : `${Math.round(job.progress * 100)}%`;
+      f('when').textContent = formatDate(job.queuedAt);
+
+      const errEl = f('error');
+      if (job.errorMessage && job.status === 'FAILED') {
+        errEl.classList.remove('hidden');
+        errEl.textContent = job.errorMessage;
+      } else {
+        errEl.classList.add('hidden');
+      }
+
+      const actions = f('actions');
+      actions.innerHTML = '';
+      const add = (label, cls, fn) => {
+        const b = document.createElement('button');
+        b.className = cls; b.textContent = label;
+        b.addEventListener('click', fn);
+        actions.appendChild(b);
+      };
+      if (job.driveWebUrl) add('Drive', 'ghost', () => window.open(job.driveWebUrl, '_blank', 'noopener'));
+      if (job.status === 'QUEUED' || job.status === 'TRANSFERRING') {
+        add('Cancel', 'ghost', () => run(job.id, 'cancel'));
+      }
+      if (job.status === 'FAILED' || job.status === 'CANCELLED') {
+        add('Retry', 'ghost', () => run(job.id, 'retry'));
+      }
+      add('Delete', 'ghost danger', () => {
+        if (confirm('Delete this job and its logs?')) run(job.id, 'remove');
+      });
+    }
+
+    async function run(id, kind) {
+      try {
+        if (kind === 'cancel') {
+          const r = await api(`/api/jobs/${id}/cancel`, { method: 'POST', body: {} });
+          upsert(r.job);
+        } else if (kind === 'retry') {
+          const r = await api(`/api/jobs/${id}/retry`, { method: 'POST', body: {} });
+          upsert(r.job);
+        } else if (kind === 'remove') {
+          await api(`/api/jobs/${id}`, { method: 'DELETE' });
+          jobs.delete(id);
+          const tr = document.querySelector(`tr[data-job-id="${id}"]`);
+          if (tr) tr.remove();
+          refreshEmpty();
+        }
+      } catch (err) { showError(err.message); }
+    }
+
+    function upsert(job) {
+      const existed = jobs.has(job.id);
+      jobs.set(job.id, job);
+      const tbody = document.getElementById('rows');
+      let tr = tbody.querySelector(`tr[data-job-id="${job.id}"]`);
+      if (!tr) {
+        tr = rowFor(job);
+        // Keep the newest-first ordering rather than always prepending.
+        const rows = Array.from(tbody.children);
+        const after = rows.find((r) => {
+          const other = jobs.get(r.dataset.jobId);
+          return other && other.queuedAt < job.queuedAt;
+        });
+        if (after) tbody.insertBefore(tr, after); else tbody.appendChild(tr);
+      } else {
+        paintRow(tr, job);
+      }
+      refreshEmpty();
+      return existed;
+    }
+
+    function refreshEmpty() {
+      const visible = document.querySelectorAll('#rows tr').length;
+      document.getElementById('empty').classList.toggle('hidden', visible > 0);
+    }
+
+    function matchesFilter(job) {
+      return status === '' || job.status === status;
+    }
+
+    async function loadPage(reset) {
+      if (reset) { cursor = null; jobs.clear(); document.getElementById('rows').innerHTML = ''; }
+      const qs = new URLSearchParams({ limit: '50' });
+      if (status) qs.set('status', status);
+      if (cursor) qs.set('cursor', cursor);
+
+      try {
+        const data = await api(`/api/jobs?${qs.toString()}`);
+        for (const job of data.jobs) if (matchesFilter(job)) upsert(job);
+        cursor = data.nextCursor;
+        document.getElementById('more').classList.toggle('hidden', !cursor);
+        refreshEmpty();
+      } catch (err) { showError(err.message); }
+    }
+
+    async function main() {
+      const me = await bootstrap('history');
+      if (!me.authenticated) { location.href = '/'; return; }
+
+      document.getElementById('filters').addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-status]');
+        if (!btn) return;
+        document.querySelectorAll('#filters button').forEach((b) => b.classList.remove('on'));
+        btn.classList.add('on');
+        status = btn.dataset.status;
+        loadPage(true);
+      });
+
+      document.getElementById('more').addEventListener('click', () => loadPage(false));
+
+      onAction('cancel', (id) => run(id, 'cancel'));
+      onAction('retry', (id) => run(id, 'retry'));
+      onAction('remove', (id) => run(id, 'remove'));
+
+      await loadPage(true);
+
+      connectProgress({
+        onSnapshot: (snap) => { for (const job of snap.jobs) if (matchesFilter(job)) upsert(job); },
+        onProgress: (event) => {
+          const existing = jobs.get(event.jobId);
+          if (!existing) {
+            if (matchesFilter({ status: event.status })) {
+              api(`/api/jobs/${event.jobId}`).then((d) => upsert(d.job)).catch(() => {});
+            }
+            return;
+          }
+          const merged = Object.assign({}, existing, {
+            status: event.status,
+            phase: event.phase,
+            transferredBytes: event.transferredBytes,
+            totalBytes: event.totalBytes,
+            progress: event.totalBytes
+              ? Math.min(1, event.transferredBytes / event.totalBytes)
+              : (event.status === 'COMPLETED' ? 1 : existing.progress),
+            speedBps: event.speedBps,
+            etaSeconds: event.etaSeconds,
+            fileName: event.fileName || existing.fileName,
+            driveWebUrl: event.webViewLink || existing.driveWebUrl,
+            errorMessage: event.error ? event.error.message : null,
+          });
+          jobs.set(event.jobId, merged);
+          const tr = document.querySelector(`tr[data-job-id="${event.jobId}"]`);
+          if (tr) paintRow(tr, merged);
+        },
+      });
+    }
+
+    main().catch((err) => showError(err.message));
+  </script>
+</body>
+</html>

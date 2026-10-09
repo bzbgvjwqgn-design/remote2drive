@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin · Remote → Drive</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="top">
+    <span class="brand">Remote → Drive</span>
+    <nav id="topnav"></nav>
+  </header>
+
+  <main class="wrap">
+    <div id="alert" class="alert"></div>
+
+    <h1>Fleet overview</h1>
+    <p class="lede">
+      Every node runs the same image; Postgres holds job state and leases, Redis holds the queue.
+      A node whose heartbeat ages out is marked offline and its jobs are recovered automatically.
+      <span id="age" class="muted"></span>
+    </p>
+
+    <div class="grid" id="stats"></div>
+
+    <h2>Nodes</h2>
+    <div class="card" style="padding:0; overflow:hidden;">
+      <table>
+        <thead>
+          <tr>
+            <th>Node</th><th>Role</th><th>Host</th>
+            <th class="num">Active</th><th class="num">Slots</th>
+            <th>Last heartbeat</th><th>Version</th>
+          </tr>
+        </thead>
+        <tbody id="nodes"></tbody>
+      </table>
+    </div>
+    <p class="notice" id="capacity"></p>
+
+    <h2>Queue</h2>
+    <div class="grid" id="queue"></div>
+
+    <h2>Stuck jobs</h2>
+    <p class="lede">
+      Marked TRANSFERRING but their lease has expired — these are mid-recovery and will be
+      picked up by the reconciler within one interval.
+    </p>
+    <div class="card" style="padding:0; overflow:hidden;">
+      <table>
+        <thead><tr><th>Job</th><th>Last owner</th><th>Lease expired</th><th>Queued</th></tr></thead>
+        <tbody id="stuck"></tbody>
+      </table>
+    </div>
+    <div id="no-stuck" class="empty hidden">No stuck jobs. Everything is leased and running.</div>
+
+    <h2>Effective configuration</h2>
+    <div class="card"><pre class="mono" id="config" style="margin:0; white-space:pre-wrap;"></pre></div>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    'use strict';
+
+    function stat(k, v) {
+      return `<div class="stat"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(String(v))}</div></div>`;
+    }
+
+    function render(data) {
+      const q = data.queue;
+      const nodes = data.nodes;
+      const online = nodes.filter((n) => n.online);
+      const slots = online.reduce((sum, n) => sum + n.concurrency, 0);
+      const busy = online.reduce((sum, n) => sum + n.activeJobs, 0);
+
+      document.getElementById('stats').innerHTML =
+        stat('Nodes online', `${online.length} / ${nodes.length}`) +
+        stat('Transfer slots', `${busy} / ${slots}`) +
+        stat('In flight', data.jobs.TRANSFERRING || 0) +
+        stat('Queued', data.jobs.QUEUED || 0) +
+        stat('Completed 24h', data.throughput.last24hCompleted) +
+        stat('Failed 24h', data.throughput.last24hFailed) +
+        stat('Bytes 24h', formatBytes(data.throughput.bytesLast24h));
+
+      document.getElementById('nodes').innerHTML = nodes.map((n) => `
+        <tr class="${n.online ? '' : 'offline'}">
+          <td><span class="dot ${n.online ? 'on' : 'off'}"></span>${escapeHtml(n.id)}</td>
+          <td>${escapeHtml(n.role)}</td>
+          <td class="mono">${escapeHtml(n.hostname)}</td>
+          <td class="num">${n.activeJobs}</td>
+          <td class="num">${n.concurrency}</td>
+          <td class="muted">${secondsAgo(n.lastSeenAt)}</td>
+          <td class="mono muted">${escapeHtml(n.version)}</td>
+        </tr>`).join('') || `<tr><td colspan="7" class="muted">No nodes have registered yet.</td></tr>`;
+
+      const utilisation = slots > 0 ? Math.round((busy / slots) * 100) : 0;
+      document.getElementById('capacity').innerHTML =
+        `<strong>Capacity.</strong> ${busy} of ${slots} slots busy (${utilisation}%). ` +
+        (q.waiting > slots
+          ? `<span style="color:var(--warn)">${q.waiting} jobs waiting with no free slot — add a worker node.</span>`
+          : 'No backlog.') +
+        ` Raise <span class="mono">MAX_CONCURRENT_JOBS</span> per node, or scale out with ` +
+        `<span class="mono">docker-compose.worker.yml</span>.`;
+
+      document.getElementById('queue').innerHTML =
+        stat('Waiting', q.waiting) + stat('Active', q.active) + stat('Delayed', q.delayed) +
+        stat('Failed (queue)', q.failed) + stat('Completed (queue)', q.completed);
+
+      document.getElementById('stuck').innerHTML = data.stuck.map((s) => `
+        <tr>
+          <td class="mono">${escapeHtml(s.id)}</td>
+          <td class="mono">${escapeHtml(s.leaseOwner || '—')}</td>
+          <td class="muted">${secondsAgo(s.leaseExpiresAt)}</td>
+          <td class="muted">${formatDate(s.queuedAt)}</td>
+        </tr>`).join('');
+      document.getElementById('no-stuck').classList.toggle('hidden', data.stuck.length > 0);
+
+      document.getElementById('config').textContent = JSON.stringify(data.config, null, 2);
+      document.getElementById('age').textContent = `Refreshed ${new Date().toLocaleTimeString()}.`;
+    }
+
+    function secondsAgo(iso) {
+      if (!iso) return '—';
+      const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+      if (s < 60) return `${s}s ago`;
+      if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+      return `${Math.floor(s / 3600)}h ago`;
+    }
+
+    async function load() {
+      try {
+        render(await api('/api/admin/overview'));
+      } catch (err) {
+        showError(err.status === 403 ? 'Your account is not in ADMIN_EMAILS.' : err.message);
+      }
+    }
+
+    async function main() {
+      const me = await bootstrap('admin');
+      if (!me.authenticated) { location.href = '/'; return; }
+      if (!me.user.isAdmin) { showError('Your account is not in ADMIN_EMAILS.'); return; }
+      await load();
+      setInterval(load, 10000);
+    }
+
+    main().catch((err) => showError(err.message));
+  </script>
+</body>
+</html>

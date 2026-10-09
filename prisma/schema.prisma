@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String         @id @default(cuid())
+  email     String         @unique
+  name      String?
+  avatarUrl String?        @map("avatar_url")
+  createdAt DateTime       @default(now()) @map("created_at")
+  lastLogin DateTime?      @map("last_login")
+  google    GoogleAccount?
+  jobs      Job[]
+
+  @@map("users")
+}
+
+/// Encrypted Google OAuth2 credentials. The refresh token and the Drive
+/// resumable-session URI are both AES-256-GCM sealed; the IV/tag are stored
+/// alongside so a key rotation can re-seal rows without losing data.
+model GoogleAccount {
+  id             String   @id @default(cuid())
+  userId         String   @unique @map("user_id")
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scope          String
+  tokenCiphertext String  @map("token_ciphertext")
+  tokenIv        String   @map("token_iv")
+  tokenTag       String   @map("token_tag")
+  tokenKeyVersion Int     @default(1) @map("token_key_version")
+  expiresAt      DateTime? @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("google_accounts")
+}
+
+enum JobStatus {
+  QUEUED
+  TRANSFERRING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model Job {
+  id              String    @id @default(cuid())
+  userId          String    @map("user_id")
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  batchId         String?   @map("batch_id")
+
+  sourceUrl       String    @map("source_url")
+  finalUrl        String?   @map("final_url")
+  fileName        String?   @map("file_name")
+  resolvedName    String?   @map("resolved_name")
+  mimeType        String?   @map("mime_type")
+  folderId        String?   @map("folder_id")
+
+  status          JobStatus @default(QUEUED)
+  phase           String?
+  totalBytes      BigInt?   @map("total_bytes")
+  transferredBytes BigInt   @default(0) @map("transferred_bytes")
+  avgSpeedBps     Float?    @map("avg_speed_bps")
+
+  supportsRange   Boolean?  @map("supports_range")
+  sessionCiphertext String? @map("session_ciphertext")
+  sessionIv       String?   @map("session_iv")
+  sessionTag      String?   @map("session_tag")
+  uploadOffset    BigInt    @default(0) @map("upload_offset")
+
+  driveFileId     String?   @map("drive_file_id")
+  driveWebUrl     String?   @map("drive_web_url")
+
+  attempts        Int       @default(0)
+  maxAttempts     Int       @default(5) @map("max_attempts")
+  nextAttemptAt   DateTime? @map("next_attempt_at")
+  errorCode       String?   @map("error_code")
+  errorMessage    String?   @map("error_message")
+
+  leaseOwner      String?   @map("lease_owner")
+  leaseExpiresAt  DateTime? @map("lease_expires_at")
+  leaseEpoch      Int       @default(0) @map("lease_epoch")
+
+  queuedAt        DateTime  @default(now()) @map("queued_at")
+  startedAt       DateTime? @map("started_at")
+  finishedAt      DateTime? @map("finished_at")
+
+  logs            JobLog[]
+
+  @@index([userId, queuedAt(sort: Desc)])
+  @@index([status, nextAttemptAt])
+  @@index([status, leaseExpiresAt])
+  @@index([batchId])
+  @@map("jobs")
+}
+
+model JobLog {
+  id      String   @id @default(cuid())
+  jobId   String   @map("job_id")
+  job     Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  level   String   @default("info")
+  event   String
+  message String
+  at      DateTime @default(now())
+
+  @@index([jobId, at])
+  @@map("job_logs")
+}
+
+/// Liveness registry backing the admin page. Rows are upserted on a heartbeat
+/// and considered stale once lastSeenAt is older than the configured TTL.
+model Node {
+  id           String   @id
+  role         String
+  hostname     String
+  version      String
+  concurrency  Int      @default(1)
+  activeJobs   Int      @default(0) @map("active_jobs")
+  queuedJobs   Int      @default(0) @map("queued_jobs")
+  startedAt    DateTime @default(now()) @map("started_at")
+  lastSeenAt   DateTime @default(now()) @map("last_seen_at")
+  meta         Json?
+
+  @@index([lastSeenAt])
+  @@map("nodes")
+}

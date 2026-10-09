@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------------------
+# Web-only node. Deploy on additional VPS machines that sit behind your load
+# balancer. Same stateless contract as the worker node: session cookies are
+# signed (not stored), so any web node can serve any request.
+#
+#   cp .env.example .env   # DATABASE_URL/REDIS_URL -> shared primary VPS
+#   NODE_ID=vps-web-02 docker compose -f docker-compose.web.yml up -d
+#
+# Then add this node's IP to the upstream block in deploy/nginx/lb.conf.
+# ---------------------------------------------------------------------------
+
+name: remote-to-drive-web
+
+services:
+  web:
+    image: ${IMAGE:-remote-to-drive:latest}
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ROLE: web
+      NODE_ENV: ${NODE_ENV:-production}
+      HOST: 0.0.0.0
+      PORT: 8080
+      TRUST_PROXY: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -1,0 +1,53 @@
+{
+	# ACME account email for Let's Encrypt renewal notices.
+	email {$ACME_EMAIL}
+	auto_https on
+	admin off
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Security headers are set here rather than in the app so that every node
+	# behind this proxy is covered uniformly.
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	# Single-node compose target. For several web VPS nodes list them all:
+	#
+	#   reverse_proxy 10.0.0.11:8080 10.0.0.12:8080 {
+	#       lb_policy round_robin
+	#       health_uri /healthz
+	#       health_interval 10s
+	#       health_timeout 3s
+	#       fail_duration 30s
+	#       flush_interval -1
+	#   }
+	reverse_proxy app:8080 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+
+		# /api/events is Server-Sent Events: disable buffering entirely and
+		# keep the connection open far longer than the default 30s.
+		flush_interval -1
+		read_timeout 24h
+		write_timeout 24h
+
+		health_uri /healthz
+		health_interval 10s
+		health_timeout 3s
+		fail_duration 30s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# Worker-only node. Deploy this on every ADDITIONAL VPS you want pulling jobs.
+# It is fully stateless: nothing is written to local disk, all job state lives
+# in the shared Postgres and all queue/pubsub traffic in the shared Redis.
+#
+#   1. Build & publish the image once from your primary node:
+#        docker build -t registry.example.com/remote-to-drive:1.0.0 .
+#        docker push  registry.example.com/remote-to-drive:1.0.0
+#   2. On each worker VPS, create .env with:
+#        DATABASE_URL=postgresql://r2d:PASS@<primary-vps-ip>:5432/r2d?schema=public
+#        REDIS_URL=redis://<primary-vps-ip>:6379
+#        ROLE=worker
+#        NODE_ID=vps-worker-02
+#        SESSION_SECRET / TOKEN_ENCRYPTION_KEY / GOOGLE_* identical to primary
+#   3. docker compose -f docker-compose.worker.yml up -d
+#
+# Firewall port 5432/6379 on the primary VPS to only accept your worker IPs.
+# ---------------------------------------------------------------------------
+
+name: remote-to-drive-worker
+
+services:
+  worker:
+    image: ${IMAGE:-remote-to-drive:latest}
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ROLE: worker
+      NODE_ENV: ${NODE_ENV:-production}
+      HOST: 0.0.0.0
+      PORT: 8080
+      TRUST_PROXY: "true"
+      # Bump this on bigger nodes; each concurrent job holds ~2x CHUNK_SIZE_MB.
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-4}
+    # Optional: expose /healthz for your own monitoring. Bind to localhost and
+    # scrape it, or put it behind your LB. Not required for correctness.
+    ports:
+      - "127.0.0.1:8081:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Remote → Drive</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <header class="top">
+    <span class="brand">Remote → Drive</span>
+    <nav id="topnav"></nav>
+  </header>
+
+  <main class="wrap">
+    <div id="alert" class="alert"></div>
+
+    <div id="signed-out" class="card hidden">
+      <h1>Sign in to start transferring</h1>
+      <p class="lede">
+        Files stream from the source URL straight into your Google Drive. Nothing is
+        written to this server's disk.
+      </p>
+      <a href="/auth/google"><button>Sign in with Google</button></a>
+      <p class="notice">
+        We request only the <span class="mono">drive.file</span> scope, which lets the app
+        create and manage the files <em>it</em> uploads. It cannot read the rest of your Drive.
+      </p>
+    </div>
+
+    <div id="app" class="hidden">
+      <h1>Transfer a URL to Google Drive</h1>
+      <p class="lede">
+        Paste one or more direct download links — one per line. The server streams each file
+        into Drive in chunks, so size is bounded by your Drive quota, not by this machine.
+      </p>
+
+      <div class="card">
+        <label for="urls">Download URLs (one per line)</label>
+        <textarea id="urls" placeholder="https://example.com/files/ubuntu-24.04.iso&#10;https://cdn.example.org/archive.tar.gz" spellcheck="false"></textarea>
+
+        <div class="row">
+          <div>
+            <label for="folder">Destination folder</label>
+            <select id="folder"><option value="">My Drive (root)</option></select>
+          </div>
+          <div>
+            <label for="filename">Custom filename (single URL only, optional)</label>
+            <input id="filename" type="text" placeholder="auto-detected" autocomplete="off" />
+          </div>
+        </div>
+
+        <div style="margin-top:18px; display:flex; gap:10px; align-items:center;">
+          <button id="submit">Start transfer</button>
+          <span id="quota" class="muted mono"></span>
+        </div>
+
+        <p class="notice" id="limits"></p>
+        <p class="notice">
+          <strong>Terms.</strong> Only transfer files you have the legal right to download and
+          store. Do not use this service for copyrighted material you are not entitled to
+          distribute, or for anything prohibited by Google's Drive terms. Your IP address and
+          the URLs you submit are logged for abuse prevention.
+        </p>
+      </div>
+
+      <h2>Live progress</h2>
+      <div id="jobs"></div>
+      <div id="empty" class="empty">Nothing running yet.</div>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+  <script>
+    'use strict';
+
+    let me = null;
+    let foldersLoaded = false;
+    const cards = new Map();
+
+    function setJobsEmpty() {
+      document.getElementById('empty').classList.toggle('hidden', cards.size > 0);
+    }
+
+    function addCard(job) {
+      const host = document.getElementById('jobs');
+      let el = cards.get(job.id);
+      if (!el) {
+        el = jobCard(job);
+        host.prepend(el);
+        cards.set(job.id, el);
+        setJobsEmpty();
+      } else {
+        paintJob(el, job);
+      }
+      return el;
+    }
+
+    async function loadFolders() {
+      if (foldersLoaded) return;
+      const select = document.getElementById('folder');
+      try {
+        const data = await api('/api/drive/folders');
+        for (const f of data.folders) {
+          const opt = document.createElement('option');
+          opt.value = f.id;
+          opt.textContent = f.name;
+          if (f.id === data.defaultFolderId) opt.selected = true;
+          select.appendChild(opt);
+        }
+        foldersLoaded = true;
+      } catch (err) {
+        // A folder-picker failure should not block transferring to the root.
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '(folder list unavailable)';
+        select.appendChild(opt);
+      }
+    }
+
+    function parseUrls(raw) {
+      return raw
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith('#'));
+    }
+
+    async function submit() {
+      clearAlert();
+      const urls = parseUrls(document.getElementById('urls').value);
+      if (urls.length === 0) { showError('Paste at least one URL.'); return; }
+
+      const folderId = document.getElementById('folder').value || null;
+      const fileName = document.getElementById('filename').value.trim() || null;
+
+      if (fileName && urls.length > 1) {
+        showError('A custom filename only applies when submitting a single URL.');
+        return;
+      }
+
+      const button = document.getElementById('submit');
+      button.disabled = true;
+      button.textContent = 'Submitting…';
+
+      try {
+        const body = fileName
+          ? { url: urls[0], fileName, folderId }
+          : { items: urls.map((url) => ({ url, fileName: null, folderId })) };
+
+        const res = await api('/api/jobs', { method: 'POST', body });
+
+        for (const job of res.accepted) addCard(job);
+
+        if (res.rejected && res.rejected.length > 0) {
+          const detail = res.rejected.map((r) => `${truncateMiddle(r.url, 60)} — ${r.reason}`).join('\n');
+          showError(`Rejected ${res.rejected.length} URL(s):\n${detail}`);
+        } else {
+          showOk(`Queued ${res.accepted.length} job(s).`);
+          document.getElementById('urls').value = '';
+          document.getElementById('filename').value = '';
+        }
+        updateQuota(res.limits);
+      } catch (err) {
+        showError(err.message);
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Start transfer';
+      }
+    }
+
+    function updateQuota(limits) {
+      const el = document.getElementById('quota');
+      if (limits) el.textContent = `${limits.active}/${limits.max} active jobs`;
+    }
+
+    async function refreshActive() {
+      try {
+        const data = await api('/api/jobs?limit=50');
+        for (const job of data.jobs) {
+          if (job.status === 'QUEUED' || job.status === 'TRANSFERRING') addCard(job);
+        }
+      } catch (err) { /* the SSE stream will fill this in */ }
+    }
+
+    async function main() {
+      me = await bootstrap('submit');
+
+      if (!me.authenticated) {
+        document.getElementById('signed-out').classList.remove('hidden');
+        return;
+      }
+      if (!me.user.driveConnected) {
+        showError('Google Drive is not connected. Sign out and sign back in to re-authorize.');
+      }
+
+      document.getElementById('app').classList.remove('hidden');
+      const L = me.limits;
+      document.getElementById('limits').innerHTML =
+        `<strong>Limits.</strong> Up to ${L.maxUrlsPerRequest} URLs per request · ` +
+        `${L.maxActiveJobsPerUser} concurrent jobs` +
+        (L.maxFileSizeBytes > 0 ? ` · ${formatBytes(L.maxFileSizeBytes)} max file size` : '') +
+        ` · streamed in ${formatBytes(L.chunkSizeBytes)} chunks.`;
+
+      onAction('cancel', async (id) => {
+        const res = await api(`/api/jobs/${id}/cancel`, { method: 'POST', body: {} });
+        addCard(res.job);
+      });
+      onAction('retry', async (id) => {
+        const res = await api(`/api/jobs/${id}/retry`, { method: 'POST', body: {} });
+        addCard(res.job);
+      });
+      onAction('remove', async (id) => {
+        await api(`/api/jobs/${id}`, { method: 'DELETE' });
+        const el = cards.get(id);
+        if (el) el.remove();
+        cards.delete(id);
+        setJobsEmpty();
+      });
+
+      await loadFolders();
+      await refreshActive();
+      setJobsEmpty();
+
+      connectProgress({
+        onSnapshot: (snap) => { for (const job of snap.jobs) addCard(job); },
+        onProgress: (event) => {
+          const el = cards.get(event.jobId);
+          if (!el) {
+            // A job we don't know about yet (submitted from another tab/node).
+            api(`/api/jobs/${event.jobId}`).then((d) => addCard(d.job)).catch(() => {});
+            return;
+          }
+          paintJob(el, applyEvent(el._job || {}, event));
+        },
+      });
+
+      document.getElementById('submit').addEventListener('click', submit);
+      document.getElementById('urls').addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit();
+      });
+    }
+
+    /* Merge an SSE progress event onto the last known job shape. */
+    function applyEvent(job, e) {
+      return Object.assign({}, job, {
+        id: e.jobId,
+        status: e.status,
+        phase: e.phase,
+        transferredBytes: e.transferredBytes,
+        totalBytes: e.totalBytes,
+        progress: e.totalBytes ? Math.min(1, e.transferredBytes / e.totalBytes) : (e.status === 'COMPLETED' ? 1 : null),
+        speedBps: e.speedBps,
+        etaSeconds: e.etaSeconds,
+        fileName: e.fileName || job.fileName,
+        driveWebUrl: e.webViewLink || job.driveWebUrl,
+        errorMessage: e.error ? e.error.message : null,
+      });
+    }
+
+    main().catch((err) => showError(err.message));
+  </script>
+</body>
+</html>
